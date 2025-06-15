@@ -1,4 +1,5 @@
 # win_ambilight
+![Preview](sc.png "Preview")
 # Monitor Backlight Sync Project
 
 This project is designed to synchronize monitor visuals with a USB-connected LED backlight strip, providing a smooth and stable ambient lighting experience.
