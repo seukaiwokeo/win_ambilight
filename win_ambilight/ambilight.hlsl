@@ -6,12 +6,15 @@ Texture2D<float4> Input : register(t0);
 
 groupshared uint localHistogram[HISTOGRAM_DIM * HISTOGRAM_DIM * HISTOGRAM_DIM];
 
-static const float kernel[3][3] = {
-    { 1, 2, 1 },
-    { 2, 4, 2 },
-    { 1, 2, 1 }
+static const float kernel[7][7] = {
+    { 0.00000067, 0.00002292, 0.00019117, 0.00038771, 0.00019117, 0.00002292, 0.00000067 },
+    { 0.00002292, 0.00078634, 0.00655965, 0.01330373, 0.00655965, 0.00078634, 0.00002292 },
+    { 0.00019117, 0.00655965, 0.05472157, 0.11098164, 0.05472157, 0.00655965, 0.00019117 },
+    { 0.00038771, 0.01330373, 0.11098164, 0.22508352, 0.11098164, 0.01330373, 0.00038771 },
+    { 0.00019117, 0.00655965, 0.05472157, 0.11098164, 0.05472157, 0.00655965, 0.00019117 },
+    { 0.00002292, 0.00078634, 0.00655965, 0.01330373, 0.00655965, 0.00078634, 0.00002292 },
+    { 0.00000067, 0.00002292, 0.00019117, 0.00038771, 0.00019117, 0.00002292, 0.00000067 }
 };
-static const float kernelWeight = 16.0;
 
 [numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
 void CSMain(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
@@ -32,21 +35,21 @@ void CSMain(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uin
         for (uint x = start.x + GTid.x; x < end.x; x += GROUP_SIZE)
         {
             float3 sum = float3(0, 0, 0);
-            [unroll]
-            for (int ky = -1; ky <= 1; ky++)
-            {
-                [unroll]
-                for (int kx = -1; kx <= 1; kx++)
-                {
-                    int2 coord = int2(x + kx, y + ky);
-                    if (all(coord >= 0) && all(coord < imgSize))
-                    {
-                        float3 color = Input.Load(int3(coord, 0)).rgb;
-                        sum += color * kernel[ky + 1][kx + 1];
-                    }
-                }
-            }
-            float3 blurred = sum / kernelWeight;
+			[unroll]
+			for (int ky = -3; ky <= 3; ky++)
+			{
+				[unroll]
+				for (int kx = -3; kx <= 3; kx++)
+				{
+					int2 coord = int2(x + kx, y + ky);
+					if (all(coord >= 0) && all(coord < imgSize))
+					{
+						float3 color = Input.Load(int3(coord, 0)).rgb;
+						sum += color * kernel[ky + 3][kx + 3];
+					}
+				}
+			}
+			float3 blurred = sum;
 
             uint3 histIndex = min(uint3(blurred * (HISTOGRAM_DIM - 1) + 0.5), HISTOGRAM_DIM - 1);
             uint histIdx = histIndex.r + histIndex.g * HISTOGRAM_DIM + histIndex.b * HISTOGRAM_DIM * HISTOGRAM_DIM;

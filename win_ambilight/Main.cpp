@@ -15,6 +15,9 @@
 #include <algorithm>
 #include <condition_variable>
 #include <libusb-1.0/libusb.h>
+#include <source_location>
+#include <future>
+#include <fstream>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -22,6 +25,8 @@
 
 #undef max
 #undef min
+
+#define SIMD
 
 constexpr int ENDPOINT_OUT = 1;
 constexpr int INTERFACE_NUMBER = 0;
@@ -31,6 +36,61 @@ constexpr int PRODUCT_ID = 0xFE07;
 constexpr int NUM_LEDS = 12;
 constexpr int NUM_GROUPS = 3;
 constexpr int TOTAL_LEDS = NUM_LEDS * NUM_GROUPS;
+
+static double min = 0.0, max = 0.0;
+
+class ScopedBenchmark {
+public:
+    ScopedBenchmark(std::string_view name, bool logFile = false, const std::source_location& location = std::source_location::current())
+        : m_name(name), m_logFile(logFile),
+        m_startTime(std::chrono::high_resolution_clock::now()),
+        m_location(location) {
+    }
+
+    ~ScopedBenchmark() {
+        const auto endTime = std::chrono::high_resolution_clock::now();
+        const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - m_startTime);
+        reportMeasurement(duration);
+    }
+
+    ScopedBenchmark(const ScopedBenchmark&) = delete;
+    ScopedBenchmark& operator=(const ScopedBenchmark&) = delete;
+
+    ScopedBenchmark(ScopedBenchmark&&) = delete;
+    ScopedBenchmark& operator=(ScopedBenchmark&&) = delete;
+
+private:
+    void reportMeasurement(std::chrono::nanoseconds duration) const {
+        const double ms = duration.count() / 1e6;
+        const double ns = duration.count();
+
+		if (ms < min || min == 0.0) {
+			min = ms;
+		}
+
+        if (ms > max) {
+            max = ms;
+        }
+
+        std::cout << std::format("{}: {:.3f} ms ({:.0f} ns)",
+            m_name, ms, ns) << std::endl;
+
+        if (m_logFile) {
+            std::cout << std::format("   {}:{} ({})",
+                m_location.file_name(),
+                m_location.line(),
+                m_location.function_name()) << std::endl;
+        }
+    }
+private:
+    std::string m_name;
+    bool m_logFile;
+    std::chrono::time_point<std::chrono::high_resolution_clock> m_startTime;
+    std::source_location m_location;
+};
+
+#define BENCHMARK(name) const auto __benchmark = ScopedBenchmark(name)
+#define BENCHMARK_FILE(name) const auto __benchmark = ScopedBenchmark(name, true)
 
 using ColorArray = std::array<std::array<float, NUM_GROUPS>, NUM_LEDS>;
 
@@ -231,15 +291,22 @@ static void readColorData(int index, int side, ID3D11ShaderResourceView* srv,
     context->CSSetShaderResources(0, 1, &srv);
     context->CSSetUnorderedAccessViews(0, 1, resultUAV.GetAddressOf(), nullptr);
 
-    const UINT dispatchX = ((srcBox.right - srcBox.left) + 31) / 32;
-    const UINT dispatchY = ((srcBox.bottom - srcBox.top) + 31) / 32;
+    const UINT dispatchX = ((srcBox.right - srcBox.left) + 15) / 16;
+    const UINT dispatchY = ((srcBox.bottom - srcBox.top) + 15) / 16;
     context->Dispatch(dispatchX, dispatchY, 1);
 
     context->CopyResource(stagingBuffer.Get(), resultBuffer.Get());
     context->Flush();
 
+
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    context->Map(stagingBuffer.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    HRESULT hr = context->Map(stagingBuffer.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr))
+    {
+        printf("Failed to map staging buffer. HRESULT: 0x%08X\n", hr);
+        return;
+    }
+
     std::copy_n(static_cast<const float*>(mapped.pData), 3, output.begin());
     context->Unmap(stagingBuffer.Get(), 0);
 }
@@ -278,71 +345,86 @@ static bool ProcessFrame(ColorArray& led1, ColorArray& led2, ColorArray& led3)
     return true;
 }
 
-static __forceinline void fast_memcpy(void* dst, const void* src, size_t size) {
-    __movsb(static_cast<unsigned char*>(dst), static_cast<const unsigned char*>(src), size);
+inline static void write_led_block(uint8_t*& ptr, const RGBData* data, uint8_t& counter) {
+    for (int i = 0; i < 12; ++i) {
+        *ptr++ = counter++;
+        *ptr++ = counter++;
+        *ptr++ = data[i].r;
+        *ptr++ = data[i].g;
+        *ptr++ = data[i].b;
+    }
 }
 
 static void BuildLedBuffer(const RGBData* topLeft, const RGBData* top, const RGBData* topRight) {
     uint8_t* __restrict ptr = ledBuffer.data();
 
-    fast_memcpy(ptr, HEADER.data(), HEADER.size());
+    // Header
+    std::memcpy(ptr, HEADER.data(), HEADER.size());
     ptr += HEADER.size();
 
-    // LED 1
+    // Ýlk LED (sabit)
     *ptr++ = topLeft[0].r;
     *ptr++ = topLeft[0].g;
     *ptr++ = topLeft[0].b;
 
-    uint8_t c = 0x1;
-    for (size_t i = 1; i < 12; ++i) {
-        *ptr++ = c++;
-        *ptr++ = c++;
-        *ptr++ = topLeft[i].r;
-        *ptr++ = topLeft[i].g;
-        *ptr++ = topLeft[i].b;
-    }
+    uint8_t counter = 0x01;
 
-    // LED 2
-    for (size_t i = 0; i < 12; ++i) {
-        *ptr++ = c++;
-        *ptr++ = c++;
-        *ptr++ = top[i].r;
-        *ptr++ = top[i].g;
-        *ptr++ = top[i].b;
-    }
+    // LED 1: topLeft[1..11]
+    write_led_block(ptr, topLeft + 1, counter);
 
-    // LED 3
-    for (size_t i = 0; i < 12; ++i) {
-        *ptr++ = c++;
-        *ptr++ = c++;
-        *ptr++ = topRight[i].r;
-        *ptr++ = topRight[i].g;
-        *ptr++ = topRight[i].b;
-    }
+    // LED 2: top[0..11]
+    write_led_block(ptr, top, counter);
 
-    __stosb(ptr, 0, ledBuffer.data() + ledBuffer.size() - ptr);
+    // LED 3: topRight[0..11]
+    write_led_block(ptr, topRight, counter);
+
+    const size_t remaining = ledBuffer.size() - (ptr - ledBuffer.data());
+    __stosb(ptr, 0, remaining);
 }
 
+#ifdef SIMD
 static __forceinline void convert_and_fill(std::span<RGBData, 12> dest, const ColorArray& src, bool reverse = false) {
-    if (reverse) {
-        for (int i = 0; i < 12; ++i) {
-            dest[i] = {
-                static_cast<uint8_t>(src[11 - i][0] * 255.0f),
-                static_cast<uint8_t>(src[11 - i][1] * 255.0f),
-                static_cast<uint8_t>(src[11 - i][2] * 255.0f)
-            };
-        }
+    alignas(32) float r[12], g[12], b[12];
+
+    for (int i = 0; i < 12; ++i) {
+        int idx = reverse ? (11 - i) : i;
+        r[i] = src[idx][0] * 255.0f;
+        g[i] = src[idx][1] * 255.0f;
+        b[i] = src[idx][2] * 255.0f;
     }
-    else {
-        for (int i = 0; i < 12; ++i) {
-            dest[i] = {
-                static_cast<uint8_t>(src[i][0] * 255.0f),
-                static_cast<uint8_t>(src[i][1] * 255.0f),
-                static_cast<uint8_t>(src[i][2] * 255.0f)
-            };
-        }
+
+    __m256 vr = _mm256_loadu_ps(r);
+    __m256 vg = _mm256_loadu_ps(g);
+    __m256 vb = _mm256_loadu_ps(b);
+    __m256 vr_tail = _mm256_loadu_ps(r + 8);
+    __m256 vg_tail = _mm256_loadu_ps(g + 8);
+    __m256 vb_tail = _mm256_loadu_ps(b + 8);
+
+    for (int i = 0; i < 8; ++i) {
+        dest[i].r = static_cast<uint8_t>(r[i]);
+        dest[i].g = static_cast<uint8_t>(g[i]);
+        dest[i].b = static_cast<uint8_t>(b[i]);
+    }
+
+    for (int i = 8; i < 12; ++i) {
+        dest[i].r = static_cast<uint8_t>(r[i]);
+        dest[i].g = static_cast<uint8_t>(g[i]);
+        dest[i].b = static_cast<uint8_t>(b[i]);
     }
 }
+#else
+static __forceinline void convert_and_fill(std::span<RGBData, 12> dest, const ColorArray& src, bool reverse = false) {
+    constexpr float scale = 255.0f;
+    for (int i = 0; i < 12; ++i) {
+        const int idx = reverse ? (11 - i) : i;
+        dest[i] = {
+            static_cast<uint8_t>(src[idx][0] * scale),
+            static_cast<uint8_t>(src[idx][1] * scale),
+            static_cast<uint8_t>(src[idx][2] * scale)
+        };
+    }
+}
+#endif
 
 static void update_leds(libusb_device_handle* handle, const ColorArray& currentColor1, const ColorArray& currentColor2, const ColorArray& currentColor3, uint8_t& counter) {
     alignas(16) std::array<RGBData, 12> dataLed1, dataLed2, dataLed3;
@@ -356,9 +438,9 @@ static void update_leds(libusb_device_handle* handle, const ColorArray& currentC
 
     int actual_length;
     constexpr int TIMEOUT = 100;
-    libusb_interrupt_transfer(handle, ENDPOINT_OUT, ledBuffer.data(), 64, &actual_length, TIMEOUT);
-    libusb_interrupt_transfer(handle, ENDPOINT_OUT, ledBuffer.data() + 64, 64, &actual_length, TIMEOUT);
-    libusb_interrupt_transfer(handle, ENDPOINT_OUT, ledBuffer.data() + 128, 64, &actual_length, TIMEOUT);
+    for (int i = 0; i < 3; ++i) {
+        libusb_interrupt_transfer(handle, ENDPOINT_OUT, ledBuffer.data() + i * 64, 64, &actual_length, TIMEOUT);
+    }
 }
 
 int main() {
@@ -395,12 +477,10 @@ int main() {
     static ColorArray targetColors[NUM_GROUPS]{};
     static ColorArray currentColors[NUM_GROUPS]{};
 
-    const float COLOR_THRESHOLD = 0.3f;
+    const float COLOR_THRESHOLD = 0.5f;
     const float TRANSITION_TIME = 0.2f;
 
     std::mutex frameMutex;
-    std::condition_variable frameCV;
-    bool frameReady = false;
     bool shouldStop = false;
 
     std::thread processThread([&]() {
@@ -411,8 +491,6 @@ int main() {
                 std::lock_guard lock(frameMutex);
                 for (auto i = 0; i < NUM_GROUPS; ++i)
                     ledColors[i] = newLed[i];
-                frameReady = true;
-                frameCV.notify_one();
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1000 / 30));
         }
@@ -424,54 +502,67 @@ int main() {
     constexpr int STABLE_FRAME_COUNT = 20;
     int changeCounter[NUM_GROUPS] = {};
 
-    while (!shouldStop) {
-        {
-            std::unique_lock lock(frameMutex);
-            frameCV.wait_for(lock, std::chrono::milliseconds(1), [&] { return frameReady; });
-            frameReady = false;
+	std::thread benchThread([]() {
+        while (true) {
+            SetConsoleTitleA(std::format("Min: {}, Max: {}", min, max).c_str());
+            Sleep(500);
         }
+		});
 
+    while (!shouldStop) {
         auto now = std::chrono::high_resolution_clock::now();
         float deltaTime = std::min(std::chrono::duration<float>(now - lastTime).count(), 0.1f);
         lastTime = now;
 
+        std::vector<std::future<void>> workers;
+        workers.reserve(NUM_GROUPS);
+
         for (int group = 0; group < NUM_GROUPS; ++group) {
-            auto& ledColor = ledColors[group];
-            auto& prevColor = prevColors[group];
-            auto& targetColor = targetColors[group];
-            auto& currentColor = currentColors[group];
+            workers.push_back(std::async(std::launch::async, [&, group]() {
+                auto& ledColor = ledColors[group];
+                auto& prevColor = prevColors[group];
+                auto& targetColor = targetColors[group];
+                auto& currentColor = currentColors[group];
 
-            float maxDiff = 0.0f;
-            for (int i = 0; i < NUM_LEDS; ++i) {
-                float diff = std::sqrt(
-                    std::pow(ledColor[i][0] - prevColor[i][0], 2) +
-                    std::pow(ledColor[i][1] - prevColor[i][1], 2) +
-                    std::pow(ledColor[i][2] - prevColor[i][2], 2)
-                );
-                maxDiff = std::max(maxDiff, diff);
-            }
-            if (maxDiff >= COLOR_THRESHOLD) {
-                prevColor = ledColor;
-                targetColor = ledColor;
-            }
+                float maxDiffSq = 0.0f;
+                for (int i = 0; i < NUM_LEDS; ++i) {
+                    float r = ledColor[i][0] - prevColor[i][0];
+                    float g = ledColor[i][1] - prevColor[i][1];
+                    float b = ledColor[i][2] - prevColor[i][2];
+                    float diffSq = r * r + g * g + b * b;
+                    maxDiffSq = std::max(maxDiffSq, diffSq);
+                }
 
-            for (int i = 0; i < NUM_LEDS; ++i) {
+                if (maxDiffSq >= (COLOR_THRESHOLD * COLOR_THRESHOLD)) {
+                    prevColor = ledColor;
+                    targetColor = ledColor;
+                }
+
                 bool transitionComplete = true;
-                for (int c = 0; c < NUM_GROUPS; ++c) {
-                    float diff = targetColor[i][c] - currentColor[i][c];
-                    if (std::abs(diff) > 0.001f) {
-                        float step = diff * deltaTime / TRANSITION_TIME;
-                        step = std::clamp(step, -std::abs(diff), std::abs(diff));
-                        currentColor[i][c] += step;
-                        transitionComplete = false;
-                    }
-                    else {
-                        currentColor[i][c] = targetColor[i][c];
+
+                for (int i = 0; i < NUM_LEDS; ++i) {
+                    for (int c = 0; c < 3; ++c) {
+                        float diff = targetColor[i][c] - currentColor[i][c];
+                        if (std::abs(diff) > 0.001f) {
+                            float step = diff * deltaTime / TRANSITION_TIME;
+                            step = std::clamp(step, -std::abs(diff), std::abs(diff));
+                            currentColor[i][c] += step;
+                            transitionComplete = false;
+                        }
+                        else {
+                            currentColor[i][c] = targetColor[i][c];
+                        }
                     }
                 }
-                if (transitionComplete)
-                    currentColor[i] = targetColor[i];
-            }
+
+                if (transitionComplete) {
+                    currentColor = targetColor;
+                }
+                }));
+        }
+
+        for (auto& w : workers) {
+            w.get();
         }
 
         update_leds(handle, currentColors[0], currentColors[1], currentColors[2], counter);

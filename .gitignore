@@ -39,3 +39,5 @@
 *.tlog
 *.txt
 *.user
+x64
+x86
