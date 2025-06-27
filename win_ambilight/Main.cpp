@@ -499,9 +499,6 @@ int main() {
     auto lastTime = std::chrono::high_resolution_clock::now();
     uint8_t counter = 0;
 
-    constexpr int STABLE_FRAME_COUNT = 20;
-    int changeCounter[NUM_GROUPS] = {};
-
 	std::thread benchThread([]() {
         while (true) {
             SetConsoleTitleA(std::format("Min: {}, Max: {}", min, max).c_str());
